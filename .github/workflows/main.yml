@@ -19,13 +19,6 @@ jobs:
         distribution: 'corretto'
         java-version: '21'
     
-    # Get release information
-    - name: Get Release Metadata
-      id: release
-      uses: pozetroninc/github-action-get-latest-release@master
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-        repository: ${{ github.repository }}
     
     # Build Android
     - name: Build APK
