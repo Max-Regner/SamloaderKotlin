@@ -1,0 +1,136 @@
+name: Android Build & Release with DeepSeek AI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    # Setup environment
+    - uses: actions/checkout@v4
+    - name: Setup JDK 21
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'corretto'
+        java-version: '21'
+    
+    # Get release information
+    - name: Get Release Metadata
+      id: release
+      uses: pozetroninc/github-action-get-latest-release@master
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        repository: ${{ github.repository }}
+    
+    # Build Android
+    - name: Build APK
+      run: |
+        chmod +x gradlew
+        ./gradlew :android:packageRelease
+        ./gradlew --stop
+    
+    # Sign APK
+    - name: Configure Build Tools
+      shell: bash
+      run: |
+        BUILD_TOOL_VERSION=$(ls /usr/local/lib/android/sdk/build-tools/ | tail -n1)
+        echo "BUILD_TOOL_VERSION=$BUILD_TOOL_VERSION" >> $GITHUB_ENV
+    
+    - name: Sign Application
+      id: sign_apk
+      uses: filippoLeporati93/android-release-signer@v1
+      with:
+        releaseDirectory: android/build/outputs/apk/release
+        signingKeyBase64: ${{ secrets.ANDROID_SIGNING_KEY }}
+        alias: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+        keyStorePassword: ${{ secrets.ANDROID_SIGNING_KEY_PWD }}
+        keyPassword: ${{ secrets.ANDROID_SIGNING_KEY_PWD }}
+      env:
+        BUILD_TOOLS_VERSION: ${{ env.BUILD_TOOL_VERSION }}
+    
+    - name: Prepare Release Assets
+      run: |
+        mv ${{ steps.sign_apk.outputs.signedReleaseFile }} \
+          android/build/outputs/apk/release/app_${{ steps.release.outputs.release }}.apk
+        
+    # DeepSeek AI Integration
+    - name: Generate Release Notes with DeepSeek
+      id: deepseek_notes
+      continue-on-error: true  # Don't fail workflow if AI fails
+      env:
+        DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      run: |
+        # Get commit history since last release
+        commits=$(git log --pretty=format:"%h - %s (%an)" HEAD~10..HEAD)
+        
+        # Call DeepSeek API
+        response=$(curl -s https://api.deepseek.com/v1/chat/completions \
+          -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "deepseek-coder",
+            "messages": [
+              {
+                "role": "system",
+                "content": "You are a release engineer. Generate concise release notes in markdown format based on commit messages. Focus on user-facing changes and improvements. Include emojis where appropriate."
+              },
+              {
+                "role": "user",
+                "content": "Create release notes for version ${{ steps.release.outputs.release }} using these commits:\n\n$commits"
+              }
+            ],
+            "max_tokens": 500
+          }')
+        
+        # Extract and format notes
+        echo "$response" | jq -r '.choices[0].message.content' > release_notes.md
+        echo "AI-generated notes saved"
+        
+    # Create fallback release notes if AI fails
+    - name: Create Default Release Notes
+      if: ${{ steps.deepseek_notes.outcome != 'success' }}
+      run: |
+        echo "## ${{ steps.release.outputs.release }} Release" > release_notes.md
+        echo "### Improvements\n- Performance optimizations\n- Bug fixes" >> release_notes.md
+        echo "🚀 Built on $(date -u +'%Y-%m-%d %H:%M UTC')" >> release_notes.md
+        
+    # Release with AI-enhanced notes
+    - name: Publish Release
+      uses: ncipollo/release-action@v1
+      with:
+        artifacts: android/build/outputs/apk/release/app_${{ steps.release.outputs.release }}.apk
+        token: ${{ secrets.GITHUB_TOKEN }}
+        tag: ${{ steps.release.outputs.release }}
+        bodyFile: release_notes.md
+        allowUpdates: true
+        omitBodyDuringUpdate: false  # Show AI-generated notes
+        
+    # UI/UX enhancements
+    - name: Post Release Summary
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const releaseNotes = fs.readFileSync('release_notes.md', 'utf8');
+          const summary = `
+          ### 🎉 Release Successful! 
+          **Version**: ${{ steps.release.outputs.release }}
+          **Build Time**: ${new Date().toUTCString()}
+          
+          ${releaseNotes}
+          
+          [Download APK](https://github.com/${{ github.repository }}/releases/download/${{ steps.release.outputs.release }}/app_${{ steps.release.outputs.release }}.apk)
+          `;
+          core.summary.addRaw(summary).write();
+          
+    # Fallback artifact upload
+    - name: Upload APK Artifact
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: android-release
+        path: android/build/outputs/apk/release/app_${{ steps.release.outputs.release }}.apk
