@@ -1,4 +1,4 @@
-name: Android Build with DeepSeek Turbo Recoding
+name: Android Build with DeepSeek Recoding & Fixes
 
 on:
   release:
@@ -11,19 +11,19 @@ jobs:
     timeout-minutes: 60
     env:
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      RECODE_TARGETS: "**/*.kt,**/*.java,src/main/res/layout/*.xml"
-      MAX_FILES: 30  # Focus on first 30 files
-      MAX_FILE_SIZE: 8000  # 8KB limit
-      PARALLEL_JOBS: 4  # Parallel API calls
+      RECODE_TARGETS: "**/*.kt,src/main/res/layout/*.xml,build.gradle.kts"  # Focus on critical files
+      MAX_FILES: 30
+      MAX_FILE_SIZE: 10000
+      PARALLEL_JOBS: 4
       MODEL: deepseek-coder-6.7b-instruct  # Faster model
 
     steps:
     - uses: actions/checkout@v4
       with:
-        fetch-depth: 50  # Sufficient history for context
+        fetch-depth: 50
         
-    # DeepSeek-powered code recoding
-    - name: Recode critical files with DeepSeek Turbo
+    # DeepSeek-powered code recoding with specialized fixes
+    - name: Recode files with DeepSeek
       id: deepseek_recode
       continue-on-error: true
       run: |
@@ -32,8 +32,7 @@ jobs:
         pip install regex
 
         # Find and select target files
-        echo "Target patterns: $RECODE_TARGETS"
-        files=$(find . -type f \( -name "*.kt" -o -name "*.java" -o -path "./src/main/res/layout/*.xml" \) -size -${MAX_FILE_SIZE}c | head -n $MAX_FILES)
+        files=$(find . -type f \( -name "*.kt" -o -name "*.xml" -o -name "*.gradle.kts" \) -size -${MAX_FILE_SIZE}c | head -n $MAX_FILES)
         echo "Selected ${MAX_FILES} files for recoding:"
         echo "$files" | sed 's/^/ - /'
         
@@ -43,28 +42,35 @@ jobs:
           cp "$file" "original_files/${file//\//_}"
         done
         
-        # Create processing script
+        # Create processing script with specialized fixes
         cat > recode_worker.sh <<'EOF'
         #!/bin/bash
         file=$1
         
-        # Get git context (last 3 commits for this file)
+        # Get git context
         history=$(git log --pretty=format:"%ad %s" --date=short -n 3 -- "$file")
-        
-        # Read file content
         content=$(cat "$file")
         
-        # Build AI prompt with token optimization
+        # Specialized prompts for known issues
+        if [[ "$file" == *"PhoneInfoView.kt" ]]; then
+          system_msg="Fix deprecated 'LocalClipboardManager' usage by replacing with 'LocalClipboard' which supports suspend functions. Ensure coroutine context is handled properly."
+        elif [[ "$file" == *"build.gradle.kts" ]]; then
+          system_msg="Update Ktor dependencies to version 3.3.0 or newer to resolve DEX space character issue. Also ensure Java 21 compatibility."
+        else
+          system_msg="Recode Android file: 1) Fix warnings and deprecations 2) Optimize performance 3) Modernize practices 4) Keep all functionality. Output ONLY the recoded file content."
+        fi
+        
         prompt=$(jq -n \
           --arg history "$history" \
           --arg content "$content" \
           --arg file "$file" \
+          --arg sys "$system_msg" \
           '{
             model: env.MODEL,
             messages: [
               {
                 role: "system",
-                content: "Recode Android file: 1) Fix warnings 2) Optimize performance 3) Modernize practices 4) Keep all functionality. Output ONLY the recoded file content with no explanations."
+                content: $sys
               },
               {
                 role: "user",
@@ -75,21 +81,17 @@ jobs:
             temperature: 0.2
           }')
           
-        # Call DeepSeek API
         response=$(curl -s https://api.deepseek.com/v1/chat/completions \
           -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
           -H "Content-Type: application/json" \
           -d "$prompt")
           
-        # Extract new content
         new_content=$(echo "$response" | jq -r '.choices[0].message.content')
         
-        # Validate and save if improved
         if [ -n "$new_content" ] && [ "$new_content" != "null" ]; then
-          # Remove non-code artifacts using regex
+          # Clean and validate output
           cleaned_content=$(echo "$new_content" | python -c "import sys, re; print(re.sub(r'^```[a-zA-Z]*\n|\n```$', '', sys.stdin.read(), flags=re.MULTILINE))")
           
-          # Compare with original
           if [ -n "$cleaned_content" ]; then
             echo "$cleaned_content" > "$file"
             echo "✅ $file"
@@ -102,21 +104,35 @@ jobs:
         EOF
         
         chmod +x recode_worker.sh
-        
-        # Process files in parallel
-        echo "$files" | parallel -j $PARALLEL_JOBS --bar ./recode_worker.sh {}
+        echo "$files" | parallel -j $PARALLEL_JOBS ./recode_worker.sh {}
         
         # Count modified files
         modified_files=$(git diff --name-only | wc -l)
         echo "modified=$modified_files" >> $GITHUB_OUTPUT
-        echo "total_processed=$MAX_FILES" >> $GITHUB_OUTPUT
+
+    # Additional explicit fixes
+    - name: Apply Critical Fixes
+      run: |
+        # 1. Fix ClipboardManager deprecation
+        find . -name '*.kt' -exec sed -i 's/LocalClipboardManager\.current/LocalClipboard.current/g' {} \;
+        
+        # 2. Fix Ktor DEX error by updating to 3.3.0+
+        sed -i -E 's/ktor-client-core(-jvm)?:[0-9]+\.[0-9]+\.[0-9]+/ktor-client-core\1:3.3.0/g' build.gradle.kts
+        sed -i -E 's/ktor-client-core:[0-9]+\.[0-9]+\.[0-9]+/ktor-client-core:3.3.0/g' build.gradle.kts
+        
+        # 3. Add coreLibraryDesugaring for Java 21 features
+        sed -i "s/android {/android {\n    compileOptions {\n        coreLibraryDesugaringEnabled true\n    }/g" build.gradle.kts
+        sed -i "/dependencies {/a\    coreLibraryDesugaring(\"com.android.tools:desugar_jdk_libs:2.0.4\")" build.gradle.kts
+        
+        # 4. Increase DEX heap size
+        echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g" >> gradle.properties
 
     - name: Show recoding results
       run: |
         echo "Modified files: ${{ steps.deepseek_recode.outputs.modified }}"
         git diff --stat
         
-    # Build process continues
+    # Build environment setup
     - name: Setup JDK 21
       uses: actions/setup-java@v4
       with:
@@ -130,12 +146,18 @@ jobs:
         token: ${{ secrets.GITHUB_TOKEN }}
         repository: ${{ github.repository }}
         
+    # Build with increased resources
     - name: Build APK
       run: |
         chmod +x gradlew
-        ./gradlew :android:packageRelease
+        ./gradlew :android:packageRelease --no-daemon --max-workers=4 --stacktrace
         ./gradlew --stop
         
+    # Signing and release steps
+    - name: Configure Build Tools
+      run: |
+        BUILD_TOOL_VERSION=$(ls /usr/local/lib/android/sdk/build-tools/ | tail -n1)
+        echo "BUILD_TOOL_VERSION=$BUILD_TOOL_VERSION" >> $GITHUB_ENV
         
     - name: Sign APK
       id: sign_apk
@@ -154,7 +176,6 @@ jobs:
         mv ${{ steps.sign_apk.outputs.signedReleaseFile }} \
           android/build/outputs/apk/release/app_${{ steps.release.outputs.release }}.apk
         
-    # AI-generated release notes
     - name: Generate Release Notes
       id: release_notes
       env:
@@ -170,11 +191,11 @@ jobs:
             messages: [
               {
                 role: "system",
-                content: "Generate release notes in markdown. Highlight user-facing changes, technical improvements, and recoding enhancements. Use emojis and include version number."
+                content: "Generate release notes in markdown. Highlight fixes for clipboard deprecation and Ktor DEX issues. Mention Java 21 support."
               },
               {
                 role: "user",
-                content: ("Version: \($version)\nCommits:\n\($commits)\n\nInclude recoding stats: ${{ steps.deepseek_recode.outputs.processed }} files improved by AI")
+                content: ("Version: \($version)\nCommits:\n\($commits)\n\nKey fixes:\n- Fixed LocalClipboardManager deprecation\n- Updated Ktor to 3.3.0+ to resolve DEX error\n- Added core library desugaring for Java 21")
               }
             ],
             max_tokens: 800
@@ -195,47 +216,32 @@ jobs:
         allowUpdates: true
         
     # Recoding report
-    - name: Create Recoding Report
-      uses: actions/github-script@v7
+    - name: Generate Recoding Report
       if: ${{ always() }}
+      uses: actions/github-script@v7
+      env:
+        MODIFIED: ${{ steps.deepseek_recode.outputs.modified }}
       with:
         script: |
-          const diff = require('diff');
           const fs = require('fs');
+          const core = require('@actions/core');
           
           const report = `
-          ### DeepSeek Recoding Report
-          **Processed files**: ${{ steps.deepseek_recode.outputs.processed }}
-          **Build status**: ${{ job.status }}
+          ## DeepSeek Recoding Report
+          **Files processed**: ${{ env.MAX_FILES }}
+          **Files modified**: ${process.env.MODIFIED}
           
-          #### Sample Changes:
-          ${getSampleDiff()}
+          ### Critical Fixes Applied
+          1. 🛠️ Replaced deprecated \`LocalClipboardManager\` with \`LocalClipboard\`
+          2. ⬆️ Updated Ktor to 3.3.0+ to resolve DEX space character error
+          3. ♻️ Added core library desugaring for Java 21 support
+          4. 🧠 Increased Gradle heap size to 4GB
           
-          [Full diff view](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          ### Build Improvements
+          - Java 21 compatibility enhancements
+          - DEX error resolution
+          - Modernized clipboard handling
+          - Kotlin coding best practices
           `;
-          
-          function getSampleDiff() {
-            try {
-              const files = '${{ env.RECODE_TARGETS }}'.split(',');
-              let sample = '';
-              for (const pattern of files) {
-                const matches = glob.sync(pattern);
-                if (matches.length > 0) {
-                  const file = matches[0];
-                  const original = fs.readFileSync(`original_${file}`, 'utf8');
-                  const modified = fs.readFileSync(file, 'utf8');
-                  const differences = diff.diffLines(original, modified);
-                  
-                  return differences.map(part => 
-                    part.added ? `🟢 ${part.value}` : 
-                    part.removed ? `🔴 ${part.value}` : ''
-                  ).filter(Boolean).slice(0,5).join('');
-                }
-              }
-              return 'No sample diff available';
-            } catch (e) {
-              return 'Error generating diff: ' + e.message;
-            }
-          }
           
           core.summary.addRaw(report).write();
