@@ -1,4 +1,4 @@
-name: Android Build & Release with DeepSeek AI
+name: Android Build with DeepSeek Recoding
 
 on:
   release:
@@ -6,35 +6,120 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-and-release:
+  recode-and-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    env:
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      RECODE_TARGETS: "**/*.kt,**/*.java,src/main/res/layout/*.xml"
+      MAX_FILE_SIZE: 10000  # 10KB limit for recoding
 
     steps:
-    # Setup environment
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history for AI context
+        
+    # DeepSeek-powered code recoding
+    - name: Recode UI and source files with DeepSeek
+      id: deepseek_recode
+      continue-on-error: true
+      run: |
+        # Install dependencies
+        sudo apt-get install -y tree jq
+        
+        # Find files to recode
+        echo "Target patterns: $RECODE_TARGETS"
+        files=$(find . -type f \( -name "*.kt" -o -name "*.java" -o -path "./src/main/res/layout/*.xml" \) -size -${MAX_FILE_SIZE}c)
+        echo "Files to recode:"
+        echo "$files" | tree -F
+        
+        # Recode each file
+        processed=0
+        for file in $files; do
+          echo "🔁 Recoding $file"
+          
+          # Get git history context
+          history=$(git log --pretty=format:"%h %ad %s" --date=short -n 3 -- $file)
+          
+          # Read file content
+          content=$(cat "$file")
+          
+          # Build AI prompt
+          prompt=$(jq -n \
+            --arg history "$history" \
+            --arg content "$content" \
+            --arg file "$file" \
+            '{
+              model: "deepseek-coder",
+              messages: [
+                {
+                  role: "system",
+                  content: "You are an expert Android developer. Recode the following file to improve code quality, performance, and modern Android practices. Maintain all functionality. Output ONLY the recoded file content with no additional text."
+                },
+                {
+                  role: "user",
+                  content: ("File: \($file)\nHistory:\n\($history)\n\nCurrent content:\n\($content)")
+                }
+              ],
+              max_tokens: 4000
+            }')
+            
+          # Call DeepSeek API
+          response=$(curl -s https://api.deepseek.com/v1/chat/completions \
+            -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$prompt")
+          
+          # Extract new content
+          new_content=$(echo "$response" | jq -r '.choices[0].message.content')
+          
+          # Validate and save
+          if [ -n "$new_content" ] && [ "$new_content" != "null" ]; then
+            echo "$new_content" > "$file"
+            echo "✅ Recoded $file"
+            processed=$((processed+1))
+          else
+            echo "⚠️ No changes for $file"
+          fi
+          
+          # Avoid rate limiting
+          sleep 1
+        done
+        
+        echo "Processed $processed files"
+        echo "processed=$processed" >> $GITHUB_OUTPUT
+
+    - name: Show recoding results
+      run: |
+        git diff --stat
+        echo "Total files recoded: ${{ steps.deepseek_recode.outputs.processed }}"
+        
+    # Build process continues
     - name: Setup JDK 21
       uses: actions/setup-java@v4
       with:
         distribution: 'corretto'
         java-version: '21'
-    
-    
-    # Build Android
+        
+    - name: Get Release Version
+      id: release
+      uses: pozetroninc/github-action-get-latest-release@master
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        repository: ${{ github.repository }}
+        
     - name: Build APK
       run: |
         chmod +x gradlew
         ./gradlew :android:packageRelease
         ./gradlew --stop
-    
-    # Sign APK
+        
     - name: Configure Build Tools
-      shell: bash
       run: |
         BUILD_TOOL_VERSION=$(ls /usr/local/lib/android/sdk/build-tools/ | tail -n1)
         echo "BUILD_TOOL_VERSION=$BUILD_TOOL_VERSION" >> $GITHUB_ENV
-    
-    - name: Sign Application
+        
+    - name: Sign APK
       id: sign_apk
       uses: filippoLeporati93/android-release-signer@v1
       with:
@@ -45,54 +130,43 @@ jobs:
         keyPassword: ${{ secrets.ANDROID_SIGNING_KEY_PWD }}
       env:
         BUILD_TOOLS_VERSION: ${{ env.BUILD_TOOL_VERSION }}
-    
-    - name: Prepare Release Assets
+        
+    - name: Prepare Release Asset
       run: |
         mv ${{ steps.sign_apk.outputs.signedReleaseFile }} \
           android/build/outputs/apk/release/app_${{ steps.release.outputs.release }}.apk
         
-    # DeepSeek AI Integration
-    - name: Generate Release Notes with DeepSeek
-      id: deepseek_notes
-      continue-on-error: true  # Don't fail workflow if AI fails
+    # AI-generated release notes
+    - name: Generate Release Notes
+      id: release_notes
       env:
-        DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        COMMIT_RANGE: $(git describe --tags --abbrev=0)..HEAD
       run: |
-        # Get commit history since last release
-        commits=$(git log --pretty=format:"%h - %s (%an)" HEAD~10..HEAD)
+        commits=$(git log --pretty=format:"%h %s (%an)" $COMMIT_RANGE)
         
-        # Call DeepSeek API
-        response=$(curl -s https://api.deepseek.com/v1/chat/completions \
-          -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
-          -H "Content-Type: application/json" \
-          -d '{
-            "model": "deepseek-coder",
-            "messages": [
+        notes_prompt=$(jq -n \
+          --arg commits "$commits" \
+          --arg version "${{ steps.release.outputs.release }}" \
+          '{
+            model: "deepseek-coder",
+            messages: [
               {
-                "role": "system",
-                "content": "You are a release engineer. Generate concise release notes in markdown format based on commit messages. Focus on user-facing changes and improvements. Include emojis where appropriate."
+                role: "system",
+                content: "Generate release notes in markdown. Highlight user-facing changes, technical improvements, and recoding enhancements. Use emojis and include version number."
               },
               {
-                "role": "user",
-                "content": "Create release notes for version ${{ steps.release.outputs.release }} using these commits:\n\n$commits"
+                role: "user",
+                content: ("Version: \($version)\nCommits:\n\($commits)\n\nInclude recoding stats: ${{ steps.deepseek_recode.outputs.processed }} files improved by AI")
               }
             ],
-            "max_tokens": 500
+            max_tokens: 800
           }')
+          
+        curl -s https://api.deepseek.com/v1/chat/completions \
+          -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d "$notes_prompt" | jq -r '.choices[0].message.content' > release_notes.md
         
-        # Extract and format notes
-        echo "$response" | jq -r '.choices[0].message.content' > release_notes.md
-        echo "AI-generated notes saved"
-        
-    # Create fallback release notes if AI fails
-    - name: Create Default Release Notes
-      if: ${{ steps.deepseek_notes.outcome != 'success' }}
-      run: |
-        echo "## ${{ steps.release.outputs.release }} Release" > release_notes.md
-        echo "### Improvements\n- Performance optimizations\n- Bug fixes" >> release_notes.md
-        echo "🚀 Built on $(date -u +'%Y-%m-%d %H:%M UTC')" >> release_notes.md
-        
-    # Release with AI-enhanced notes
     - name: Publish Release
       uses: ncipollo/release-action@v1
       with:
@@ -101,29 +175,49 @@ jobs:
         tag: ${{ steps.release.outputs.release }}
         bodyFile: release_notes.md
         allowUpdates: true
-        omitBodyDuringUpdate: false  # Show AI-generated notes
         
-    # UI/UX enhancements
-    - name: Post Release Summary
+    # Recoding report
+    - name: Create Recoding Report
       uses: actions/github-script@v7
+      if: ${{ always() }}
       with:
         script: |
-          const releaseNotes = fs.readFileSync('release_notes.md', 'utf8');
-          const summary = `
-          ### 🎉 Release Successful! 
-          **Version**: ${{ steps.release.outputs.release }}
-          **Build Time**: ${new Date().toUTCString()}
+          const diff = require('diff');
+          const fs = require('fs');
           
-          ${releaseNotes}
+          const report = `
+          ### DeepSeek Recoding Report
+          **Processed files**: ${{ steps.deepseek_recode.outputs.processed }}
+          **Build status**: ${{ job.status }}
           
-          [Download APK](https://github.com/${{ github.repository }}/releases/download/${{ steps.release.outputs.release }}/app_${{ steps.release.outputs.release }}.apk)
+          #### Sample Changes:
+          ${getSampleDiff()}
+          
+          [Full diff view](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
           `;
-          core.summary.addRaw(summary).write();
           
-    # Fallback artifact upload
-    - name: Upload APK Artifact
-      if: ${{ always() }}
-      uses: actions/upload-artifact@v4
-      with:
-        name: android-release
-        path: android/build/outputs/apk/release/app_${{ steps.release.outputs.release }}.apk
+          function getSampleDiff() {
+            try {
+              const files = '${{ env.RECODE_TARGETS }}'.split(',');
+              let sample = '';
+              for (const pattern of files) {
+                const matches = glob.sync(pattern);
+                if (matches.length > 0) {
+                  const file = matches[0];
+                  const original = fs.readFileSync(`original_${file}`, 'utf8');
+                  const modified = fs.readFileSync(file, 'utf8');
+                  const differences = diff.diffLines(original, modified);
+                  
+                  return differences.map(part => 
+                    part.added ? `🟢 ${part.value}` : 
+                    part.removed ? `🔴 ${part.value}` : ''
+                  ).filter(Boolean).slice(0,5).join('');
+                }
+              }
+              return 'No sample diff available';
+            } catch (e) {
+              return 'Error generating diff: ' + e.message;
+            }
+          }
+          
+          core.summary.addRaw(report).write();
