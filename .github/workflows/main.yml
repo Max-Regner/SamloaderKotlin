@@ -1,4 +1,4 @@
-name: Android Build with DeepSeek Recoding
+name: Android Build with DeepSeek Turbo Recoding
 
 on:
   release:
@@ -8,91 +8,113 @@ on:
 jobs:
   recode-and-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
       RECODE_TARGETS: "**/*.kt,**/*.java,src/main/res/layout/*.xml"
-      MAX_FILE_SIZE: 10000  # 10KB limit for recoding
+      MAX_FILES: 30  # Focus on first 30 files
+      MAX_FILE_SIZE: 8000  # 8KB limit
+      PARALLEL_JOBS: 4  # Parallel API calls
+      MODEL: deepseek-coder-6.7b-instruct  # Faster model
 
     steps:
     - uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # Full history for AI context
+        fetch-depth: 50  # Sufficient history for context
         
     # DeepSeek-powered code recoding
-    - name: Recode UI and source files with DeepSeek
+    - name: Recode critical files with DeepSeek Turbo
       id: deepseek_recode
       continue-on-error: true
       run: |
         # Install dependencies
-        sudo apt-get install -y tree jq
-        
-        # Find files to recode
+        sudo apt-get install -y jq parallel
+        pip install regex
+
+        # Find and select target files
         echo "Target patterns: $RECODE_TARGETS"
-        files=$(find . -type f \( -name "*.kt" -o -name "*.java" -o -path "./src/main/res/layout/*.xml" \) -size -${MAX_FILE_SIZE}c)
-        echo "Files to recode:"
-        echo "$files" | tree -F
+        files=$(find . -type f \( -name "*.kt" -o -name "*.java" -o -path "./src/main/res/layout/*.xml" \) -size -${MAX_FILE_SIZE}c | head -n $MAX_FILES)
+        echo "Selected ${MAX_FILES} files for recoding:"
+        echo "$files" | sed 's/^/ - /'
         
-        # Recode each file
-        processed=0
+        # Backup original files
+        mkdir -p original_files
         for file in $files; do
-          echo "🔁 Recoding $file"
-          
-          # Get git history context
-          history=$(git log --pretty=format:"%h %ad %s" --date=short -n 3 -- $file)
-          
-          # Read file content
-          content=$(cat "$file")
-          
-          # Build AI prompt
-          prompt=$(jq -n \
-            --arg history "$history" \
-            --arg content "$content" \
-            --arg file "$file" \
-            '{
-              model: "deepseek-coder",
-              messages: [
-                {
-                  role: "system",
-                  content: "You are an expert Android developer. Recode the following file to improve code quality, performance, and modern Android practices. Maintain all functionality. Output ONLY the recoded file content with no additional text."
-                },
-                {
-                  role: "user",
-                  content: ("File: \($file)\nHistory:\n\($history)\n\nCurrent content:\n\($content)")
-                }
-              ],
-              max_tokens: 4000
-            }')
-            
-          # Call DeepSeek API
-          response=$(curl -s https://api.deepseek.com/v1/chat/completions \
-            -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
-            -H "Content-Type: application/json" \
-            -d "$prompt")
-          
-          # Extract new content
-          new_content=$(echo "$response" | jq -r '.choices[0].message.content')
-          
-          # Validate and save
-          if [ -n "$new_content" ] && [ "$new_content" != "null" ]; then
-            echo "$new_content" > "$file"
-            echo "✅ Recoded $file"
-            processed=$((processed+1))
-          else
-            echo "⚠️ No changes for $file"
-          fi
-          
-          # Avoid rate limiting
-          sleep 1
+          cp "$file" "original_files/${file//\//_}"
         done
         
-        echo "Processed $processed files"
-        echo "processed=$processed" >> $GITHUB_OUTPUT
+        # Create processing script
+        cat > recode_worker.sh <<'EOF'
+        #!/bin/bash
+        file=$1
+        
+        # Get git context (last 3 commits for this file)
+        history=$(git log --pretty=format:"%ad %s" --date=short -n 3 -- "$file")
+        
+        # Read file content
+        content=$(cat "$file")
+        
+        # Build AI prompt with token optimization
+        prompt=$(jq -n \
+          --arg history "$history" \
+          --arg content "$content" \
+          --arg file "$file" \
+          '{
+            model: env.MODEL,
+            messages: [
+              {
+                role: "system",
+                content: "Recode Android file: 1) Fix warnings 2) Optimize performance 3) Modernize practices 4) Keep all functionality. Output ONLY the recoded file content with no explanations."
+              },
+              {
+                role: "user",
+                content: ("File: \($file)\nHistory:\n\($history)\n\nCurrent content:\n\($content)")
+              }
+            ],
+            max_tokens: 4096,
+            temperature: 0.2
+          }')
+          
+        # Call DeepSeek API
+        response=$(curl -s https://api.deepseek.com/v1/chat/completions \
+          -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d "$prompt")
+          
+        # Extract new content
+        new_content=$(echo "$response" | jq -r '.choices[0].message.content')
+        
+        # Validate and save if improved
+        if [ -n "$new_content" ] && [ "$new_content" != "null" ]; then
+          # Remove non-code artifacts using regex
+          cleaned_content=$(echo "$new_content" | python -c "import sys, re; print(re.sub(r'^```[a-zA-Z]*\n|\n```$', '', sys.stdin.read(), flags=re.MULTILINE))")
+          
+          # Compare with original
+          if [ -n "$cleaned_content" ]; then
+            echo "$cleaned_content" > "$file"
+            echo "✅ $file"
+          else
+            echo "⚠️ Empty output for $file"
+          fi
+        else
+          echo "⚠️ No changes for $file"
+        fi
+        EOF
+        
+        chmod +x recode_worker.sh
+        
+        # Process files in parallel
+        echo "$files" | parallel -j $PARALLEL_JOBS --bar ./recode_worker.sh {}
+        
+        # Count modified files
+        modified_files=$(git diff --name-only | wc -l)
+        echo "modified=$modified_files" >> $GITHUB_OUTPUT
+        echo "total_processed=$MAX_FILES" >> $GITHUB_OUTPUT
 
     - name: Show recoding results
       run: |
+        echo "Modified files: ${{ steps.deepseek_recode.outputs.modified }}"
         git diff --stat
-        echo "Total files recoded: ${{ steps.deepseek_recode.outputs.processed }}"
         
     # Build process continues
     - name: Setup JDK 21
@@ -114,10 +136,6 @@ jobs:
         ./gradlew :android:packageRelease
         ./gradlew --stop
         
-    - name: Configure Build Tools
-      run: |
-        BUILD_TOOL_VERSION=$(ls /usr/local/lib/android/sdk/build-tools/ | tail -n1)
-        echo "BUILD_TOOL_VERSION=$BUILD_TOOL_VERSION" >> $GITHUB_ENV
         
     - name: Sign APK
       id: sign_apk
